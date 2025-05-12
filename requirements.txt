@@ -27,3 +27,6 @@ Cython>=0.29.33
 Werkzeug==2.3.7
 typing-extensions>=4.0.0
 accelerate==0.20.3
+
+bert-score==0.3.13
+evaluate==0.3.0

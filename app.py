@@ -16,6 +16,11 @@ import os
 import logging
 import time
 import traceback
+import jieba
+from bert_score import score as bert_score
+import evaluate
+from transformers import AutoTokenizer, AutoModel
+import torch
 
 # 載入環境變數
 load_dotenv()
@@ -24,7 +29,10 @@ app = Flask(__name__)
 api = Api(app, version='1.0', 
           title='向量檢索 API',
           description='支援多種檢索方法和評估指標的向量檢索 API',
-          doc='/docs')
+          doc='/docs',
+          default='retrieve',  # 設置默認命名空間
+          ordered=True  # 保持參數順序
+        )
 
 # API 配置
 NOCODB_API_URL = os.getenv('NOCODB_API_URL', 'https://mynocodb.zeabur.app/api/v2/tables/mno08ehjtvwt6w2/records')
@@ -49,13 +57,57 @@ ns = api.namespace('api', description='檢索操作')
 # 下載必要的 NLTK 資料
 nltk.download('punkt')
 
-# API 請求和回應模型定義
+# API 請求模型定義
 retrieve_request = api.model('RetrieveRequest', {
-    'embedding_model': fields.String(description='使用的嵌入模型名稱', required=False, default=DEFAULT_EMBEDDING_MODEL),
-    'retriever_method': fields.String(description='檢索方法 (top_k 或 mmr)', required=False, default=DEFAULT_RETRIEVER_METHOD),
-    'k_value': fields.Integer(description='返回的文檔數量', required=False, default=DEFAULT_K_VALUE),
-    'query': fields.String(description='查詢文本', required=True),
-    'model': fields.String(description='使用的生成模型 (gpt-4 或 gemini)', required=False, default=DEFAULT_GPT_MODEL)
+    'embedding_model': fields.String(
+        description='使用的嵌入模型名稱，用於文本向量化。預設值：paraphrase-multilingual-MiniLM-L12-v2',
+        required=False, 
+        default=DEFAULT_EMBEDDING_MODEL
+    ),
+    'retriever_method': fields.String(
+        description='檢索方法：\n'
+                   '- top_k：直接返回最相似的 k 個文檔\n'
+                   '- mmr：最大邊際相關性，在相關性和多樣性之間取得平衡',
+        required=False,
+        default=DEFAULT_RETRIEVER_METHOD,
+        enum=['top_k', 'mmr']
+    ),
+    'k_value': fields.Integer(
+        description='返回的文檔數量，建議範圍：1-10',
+        required=False,
+        default=DEFAULT_K_VALUE,
+        min=1,
+        max=10
+    ),
+    'query': fields.String(
+        description='查詢文本，用戶想要查詢的問題或關鍵詞',
+        required=True
+    ),
+    'model': fields.String(
+        description='使用的生成模型：\n'
+                   '- gpt-4：使用 OpenAI 的 GPT-4 模型\n'
+                   '- gemini：使用 Google 的 Gemini 模型',
+        required=False,
+        default=DEFAULT_GPT_MODEL,
+        enum=['gpt-4', 'gemini']
+    ),
+    'model_name': fields.String(
+        description='指定的具體模型版本：\n'
+                   '- GPT-4 系列：gpt-4, gpt-4-32k, gpt-4-turbo\n'
+                   '- Gemini 系列：gemini-1.0-pro, gemini-1.0-ultra, gemini-2.0-flash, gemini-2.0-pro',
+        required=False
+    ),
+    'temperature': fields.Float(
+        description='生成模型的溫度參數 (0.0-1.0)，控制回答的創造性，越低越保守。建議範圍：0.2-0.5',
+        required=False,
+        default=0.2,
+        min=0.0,
+        max=1.0
+    ),
+    'prompt': fields.String(
+        description='自定義的系統提示詞模板，用於自定義模型的行為指南和回答風格',
+        required=False
+    )
 })
 
 document_model = api.model('Document', {
@@ -64,29 +116,55 @@ document_model = api.model('Document', {
 })
 
 metrics_model = api.model('Metrics', {
-    'bleu': fields.Float(description='BLEU 分數'),
-    'rouge1': fields.Float(description='ROUGE-1 分數'),
-    'rouge2': fields.Float(description='ROUGE-2 分數'),
-    'rougeL': fields.Float(description='ROUGE-L 分數'),
-    'mrr': fields.Float(description='MRR 分數'),
-    'recall_at_k': fields.Float(description='Recall@k 分數'),
-    'gpt_4_quality': fields.Float(description='GPT-4 回答質量評分'),
-    'gemini_quality': fields.Float(description='Gemini 2.0 回答質量評分')
+    'bert_score_p': fields.Float(
+        description='BERTScore 精確率 (0-1)：衡量生成文本中有多少內容是相關的。理想值 > 0.7'
+    ),
+    'bert_score_r': fields.Float(
+        description='BERTScore 召回率 (0-1)：衡量參考文本中有多少內容被覆蓋到。理想值 > 0.7'
+    ),
+    'bert_score_f1': fields.Float(
+        description='BERTScore F1 分數 (0-1)：精確率和召回率的調和平均。理想值 > 0.7'
+    ),
+    'semantic_similarity': fields.Float(
+        description='語義相似度 (0-1)：使用中文 BERT 計算的語義層面相似程度。理想值 > 0.8'
+    ),
+    'rouge_score': fields.Float(
+        description='ROUGE-L 分數 (0-1)：評估生成文本與參考文本的重疊程度。理想值 > 0.4'
+    ),
+    'mrr_score': fields.Float(
+        description='平均倒數排名分數 (0-1)：評估檢索結果的排序質量。理想值 > 0.5'
+    ),
+    'exact_match': fields.Float(
+        description='完全匹配分數 (0-1)：計算生成文本和參考文本的詞彙重疊程度。理想值 > 0.3'
+    )
 })
 
 response_model = api.model('Response', {
     'model_response': fields.Nested(api.model('ModelResponse', {
-        'answer': fields.String(description='Model response'),
-        'metrics': fields.Nested(api.model('Metrics', {
-            'bleu_score': fields.Float(description='BLEU score'),
-            'rouge_score': fields.Float(description='ROUGE score'),
-            'mrr_score': fields.Float(description='MRR score')
-        }))
+        'answer': fields.String(description='模型生成的回答內容'),
+        'metrics': fields.Nested(metrics_model)
     })),
-    'retrieved_docs': fields.List(fields.String, description='Retrieved documents'),
-    'similarity_scores': fields.List(fields.Float, description='Similarity scores'),
-    'execution_time': fields.Float(description='API execution time in seconds')
+    'retrieved_docs': fields.List(
+        fields.String, 
+        description='檢索到的相關文檔列表'
+    ),
+    'similarity_scores': fields.List(
+        fields.Float, 
+        description='每個檢索文檔與查詢的相似度分數 (0-1)'
+    ),
+    'execution_time': fields.Float(
+        description='API 執行時間（秒）'
+    )
 })
+
+# 定義允許的模型類型
+ALLOWED_MODELS = ["gpt-4", "gemini"]
+
+# 定義每種模型類型支援的具體模型版本
+SUPPORTED_MODEL_NAMES = {
+    "gpt-4": ["gpt-4", "gpt-4-32k", "gpt-4-turbo"],
+    "gemini": ["gemini-1.0-pro", "gemini-1.0-ultra", "gemini-2.0-flash", "gemini-2.0-pro"]
+}
 
 def fetch_documents_from_api():
     """從 API 獲取文檔數據"""
@@ -285,38 +363,12 @@ class Retriever:
                 "error": str(e)
             }
 
-def get_gpt_response(prompt: str) -> str:
+def get_gpt_response(messages: List[Dict[str, str]], model_name: str = None) -> str:
     try:
-        messages = [
-            {"role": "system", "content": """你是一個專業的 AI 助手，專門提供高度相關且精確的回答。請嚴格遵循以下指南：
-
-1. 分析要求：
-   - 仔細識別參考資料中的關鍵詞和重要概念
-   - 確保回答中包含這些關鍵詞
-   - 保持與參考資料的用詞一致性
-
-2. 回答結構：
-   - 使用參考資料中的原始措辭和表達方式
-   - 按照參考資料的邏輯順序組織回答
-   - 確保每個重要概念都有對應的關鍵詞支持
-
-3. 品質控制：
-   - 不要改寫或意譯關鍵術語
-   - 直接引用參考資料中的重要片段
-   - 確保回答與參考資料的描述完全一致
-   - 避免添加未在參考資料中出現的解釋或推論
-
-4. 輸出要求：
-   - 回答必須完全基於提供的參考資料
-   - 使用參考資料中的原始關鍵詞
-   - 保持專業且準確的表達方式"""},
-            {"role": "user", "content": prompt}
-        ]
-        
         response = openai.ChatCompletion.create(
-            model=DEFAULT_GPT_MODEL,
+            model=model_name if model_name else DEFAULT_GPT_MODEL,
             messages=messages,
-            temperature=0.2,  # 降低溫度以提高準確性和一致性
+            temperature=0.2,
             max_tokens=1000
         )
         return response.choices[0].message.content.strip()
@@ -324,9 +376,10 @@ def get_gpt_response(prompt: str) -> str:
         print(f"GPT API 錯誤: {str(e)}")
         return ""
 
-def get_gemini_response(prompt: str) -> str:
+def get_gemini_response(prompt: str, model_name: str = None) -> str:
     try:
-        model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.0-flash'))
+        # 使用指定的模型名稱或默認值
+        model = genai.GenerativeModel(model_name if model_name else os.getenv('GEMINI_MODEL', 'gemini-2.0-flash'))
         chat = model.start_chat(history=[])
         
         system_prompt = """作為專業的 AI 助手，你必須嚴格遵循以下指南：
@@ -354,7 +407,7 @@ def get_gemini_response(prompt: str) -> str:
         
         full_prompt = f"{system_prompt}\n\n{prompt}"
         response = chat.send_message(full_prompt, generation_config=genai.types.GenerationConfig(
-            temperature=0.2,  # 降低溫度以提高準確性和一致性
+            temperature=0.2,
             max_output_tokens=1000
         ))
         return response.text.strip()
@@ -430,11 +483,11 @@ def calculate_metrics(retrieved_docs: List[Dict[str, Any]], query: str, model: s
     
     # 根據模型選擇評估
     if model == "gemini":
-        gemini_response = get_gemini_response(prompt)
+        gemini_response = get_gemini_response(prompt, model_name=model_name)
         if gemini_response:
             gemini_quality = evaluate_model_quality(retrieved_docs[0]['document'], gemini_response)
     else:  # 預設使用 gpt-4
-        gpt_4_response = get_gpt_response(prompt)
+        gpt_4_response = get_gpt_response(prompt, model_name=model_name)
         if gpt_4_response:
             gpt_4_quality = evaluate_model_quality(retrieved_docs[0]['document'], gpt_4_response)
 
@@ -449,146 +502,248 @@ def calculate_metrics(retrieved_docs: List[Dict[str, Any]], query: str, model: s
         'gemini_quality': gemini_quality
     }
 
-def get_model_response(query: str, model: str, context: str) -> Dict[str, Any]:
+def calculate_semantic_similarity(text1: str, text2: str, model_name: str = 'ckiplab/bert-base-chinese') -> float:
+    """計算兩段文本的語義相似度"""
+    try:
+        # 載入模型和分詞器
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        
+        # 對文本進行編碼
+        inputs1 = tokenizer(text1, return_tensors='pt', padding=True, truncation=True, max_length=512)
+        inputs2 = tokenizer(text2, return_tensors='pt', padding=True, truncation=True, max_length=512)
+        
+        # 獲取文本嵌入
+        with torch.no_grad():
+            embeddings1 = model(**inputs1).last_hidden_state.mean(dim=1)
+            embeddings2 = model(**inputs2).last_hidden_state.mean(dim=1)
+        
+        # 計算餘弦相似度
+        similarity = torch.nn.functional.cosine_similarity(embeddings1, embeddings2)
+        return round(float(similarity[0]), 2)
+    except Exception as e:
+        logging.error(f"計算語義相似度時發生錯誤: {str(e)}")
+        return 0.0
+
+def calculate_exact_match(prediction: str, reference: str) -> float:
+    """計算完全匹配分數"""
+    # 對文本進行預處理：分詞並去除標點符號
+    prediction_tokens = set(jieba.cut(prediction))
+    reference_tokens = set(jieba.cut(reference))
+    
+    # 計算交集比例
+    if not reference_tokens:
+        return 0.0
+    
+    intersection = prediction_tokens.intersection(reference_tokens)
+    return round(len(intersection) / len(reference_tokens), 2)
+
+def get_model_response(query: str, model: str, context: str, model_name: str = None, custom_prompt: str = None) -> Dict[str, Any]:
     """根據選擇的模型生成回應並計算指標"""
-    prompt = f"""基於以下參考資料回答問題。請遵循以下要求：
-1. 提供一個完整且連貫的回答
-2. 使用參考資料中的關鍵詞和表述
-3. 保持專業且精確的表達
-4. 以摘要形式組織內容
+    # 使用自定義系統提示詞或默認系統提示詞
+    system_prompt = custom_prompt if custom_prompt else """作為專業的 AI 助手，你必須嚴格遵循以下指南：
 
-參考資料：{context}
+1. 內容分析：
+   - 識別參考資料中的所有關鍵詞和核心概念
+   - 確保回答包含這些關鍵詞
+   - 維持與參考資料相同的專業術語使用
 
-問題：{query}"""
+2. 回答要求：
+   - 直接使用參考資料中的原始表述
+   - 保持與參考資料一致的描述方式
+   - 確保每個關鍵概念都有對應的原文支持
+
+3. 準確性控制：
+   - 不要改變關鍵詞的原始含義
+   - 優先使用直接引用而非改寫
+   - 確保回答與參考資料的描述完全匹配
+   - 禁止添加參考資料以外的內容
+
+4. 格式規範：
+   - 回答必須完全基於參考資料
+   - 保留原始關鍵詞的使用方式
+   - 維持專業且精確的表達"""
+
+    # 固定的用戶提示詞格式
+    user_prompt = f"參考資料：{context}\n\n問題：{query}"
     
     try:
         if model == "gemini":
-            response = get_gemini_response(prompt)
+            # 使用指定的 Gemini 模型版本（如果提供）
+            gemini_model_name = model_name if model_name else os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
+            # 組合系統提示詞和用戶提示詞
+            full_prompt = f"{system_prompt}\n\n{user_prompt}"
+            response = get_gemini_response(full_prompt, model_name=gemini_model_name)
             quality_score = evaluate_model_quality(context, response) if response else 0.0
             
-            # 計算其他指標
+            # 計算 BERTScore
+            P, R, F1 = bert_score([response], [context], lang='zh', verbose=False)
+            bert_scores = {
+                'precision': round(float(P[0]), 2),
+                'recall': round(float(R[0]), 2),
+                'f1': round(float(F1[0]), 2)
+            }
+            
+            # 計算語義相似度
+            semantic_sim = calculate_semantic_similarity(response, context)
+            
+            # 計算完全匹配分數
+            exact_match_score = calculate_exact_match(response, context)
+            
+            # 計算 ROUGE 分數
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
             rouge_scores = scorer.score(response, context) if response else None
             
             return {
                 'answer': response,
                 'metrics': {
-                    'bleu_score': round(sacrebleu.corpus_bleu([response], [[context]]).score / 100, 2) if response else 0.0,
+                    'bert_score_p': bert_scores['precision'],
+                    'bert_score_r': bert_scores['recall'],
+                    'bert_score_f1': bert_scores['f1'],
+                    'semantic_similarity': semantic_sim,
                     'rouge_score': round(rouge_scores['rougeL'].fmeasure, 2) if rouge_scores else 0.0,
-                    'mrr_score': quality_score
+                    'mrr_score': quality_score,
+                    'exact_match': exact_match_score
                 }
             }
-        else:  # 預設使用 gpt-4
-            response = get_gpt_response(prompt)
+        else:  # GPT-4
+            # 使用指定的 GPT 模型版本（如果提供）
+            gpt_model_name = model_name if model_name else DEFAULT_GPT_MODEL
+            # 使用 messages 陣列分別傳遞系統提示詞和用戶提示詞
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            response = get_gpt_response(messages, model_name=gpt_model_name)
             quality_score = evaluate_model_quality(context, response) if response else 0.0
             
-            # 計算其他指標
+            # 計算 BERTScore
+            P, R, F1 = bert_score([response], [context], lang='zh', verbose=False)
+            bert_scores = {
+                'precision': round(float(P[0]), 2),
+                'recall': round(float(R[0]), 2),
+                'f1': round(float(F1[0]), 2)
+            }
+            
+            # 計算語義相似度
+            semantic_sim = calculate_semantic_similarity(response, context)
+            
+            # 計算完全匹配分數
+            exact_match_score = calculate_exact_match(response, context)
+            
+            # 計算 ROUGE 分數
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
             rouge_scores = scorer.score(response, context) if response else None
             
             return {
                 'answer': response,
                 'metrics': {
-                    'bleu_score': round(sacrebleu.corpus_bleu([response], [[context]]).score / 100, 2) if response else 0.0,
+                    'bert_score_p': bert_scores['precision'],
+                    'bert_score_r': bert_scores['recall'],
+                    'bert_score_f1': bert_scores['f1'],
+                    'semantic_similarity': semantic_sim,
                     'rouge_score': round(rouge_scores['rougeL'].fmeasure, 2) if rouge_scores else 0.0,
-                    'mrr_score': quality_score
+                    'mrr_score': quality_score,
+                    'exact_match': exact_match_score
                 }
             }
     except Exception as e:
         logging.error(f"生成模型回應時發生錯誤: {str(e)}")
         return {
-            'answer': "",
+            'answer': str(e),
             'metrics': {
-                'bleu_score': 0.0,
+                'bert_score_p': 0.0,
+                'bert_score_r': 0.0,
+                'bert_score_f1': 0.0,
+                'semantic_similarity': 0.0,
                 'rouge_score': 0.0,
-                'mrr_score': 0.0
+                'mrr_score': 0.0,
+                'exact_match': 0.0
             }
         }
 
+# 在定義完 Retriever 類之後初始化全局檢索器實例
+retriever = Retriever(documents=documents, model_name=DEFAULT_EMBEDDING_MODEL)
+
 @ns.route('/retrieve')
-class DocumentRetrieval(Resource):
+class Retrieve(Resource):
     @ns.expect(retrieve_request)
     @ns.marshal_with(response_model)
-    @ns.doc(description='根據查詢檢索相關文檔並計算評估指標')
+    @ns.doc(
+        description='根據查詢檢索相關文檔並生成回答，同時計算多個評估指標\n\n'
+                   '使用建議：\n'
+                   '1. 一般查詢建議使用預設參數\n'
+                   '2. 需要更多相關文檔時可調整 k_value\n'
+                   '3. 需要更多樣化的檢索結果時使用 mmr 方法\n'
+                   '4. 對回答質量要求較高時建議使用 GPT-4\n'
+                   '5. 需要更快速的回應時可使用 Gemini\n'
+                   '6. 溫度參數建議保持在 0.2-0.5 之間'
+    )
     def post(self):
-        """
-        檢索文檔並計算相關指標
-        
-        從文檔集合中檢索與查詢最相關的文檔，並計算相關性指標。
-        支援 top-k 和 MMR 兩種檢索方法，以及 GPT-4 和 Gemini 2.0 兩種生成模型。
-        """
         start_time = time.time()
         data = api.payload
         query = data['query']
-        model_name = data.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
-        method = data.get('retriever_method', DEFAULT_RETRIEVER_METHOD)
+        embedding_model = data.get('embedding_model', DEFAULT_EMBEDDING_MODEL)
+        retriever_method = data.get('retriever_method', DEFAULT_RETRIEVER_METHOD)
         k = data.get('k_value', DEFAULT_K_VALUE)
         model = data.get('model', DEFAULT_GPT_MODEL)
+        model_name = data.get('model_name')
+        temperature = data.get('temperature', 0.2)
+        custom_prompt = data.get('prompt')  # 獲取自定義 prompt
 
         try:
-            # 初始化檢索器
-            retriever = Retriever(documents, model_name)
+            # 驗證模型類型
+            if model not in ALLOWED_MODELS:
+                raise ValueError(f"不支援的模型類型: {model}。支援的模型類型有: {', '.join(ALLOWED_MODELS)}")
 
-            # 根據選擇的方法進行檢索
-            if method == 'mmr':
-                retrieved_docs = retriever.mmr_retrieval(query, k)
+            # 驗證具體模型版本（如果提供）
+            if model_name:
+                if model_name not in SUPPORTED_MODEL_NAMES[model]:
+                    raise ValueError(f"不支援的模型版本: {model_name}。{model} 支援的版本有: {', '.join(SUPPORTED_MODEL_NAMES[model])}")
+
+            # 驗證檢索方法
+            if retriever_method not in ['top_k', 'mmr']:
+                raise ValueError(f"不支援的檢索方法: {retriever_method}。支援的方法有: top_k, mmr")
+
+            # 使用檢索器獲取相關文檔
+            if retriever_method == 'mmr':
+                docs = retriever.mmr_retrieval(query=query, k=k)
             else:
-                retrieved_docs = retriever.top_k_retrieval(query, k)
+                docs = retriever.top_k_retrieval(query=query, k=k)
 
             # 使用檢索到的文檔作為上下文生成回應
-            context = "\n".join([doc['document'] for doc in retrieved_docs])
+            context = "\n".join([doc['document'] for doc in docs])
             
-            # 初始化回應變數
-            gpt4_response = None
-            gemini_response = None
-            
-            # 只調用使用者選擇的模型
-            if model == "gpt-4":
-                gpt4_response = get_model_response(query, "gpt-4", context)
-            elif model == "gemini":
-                gemini_response = get_model_response(query, "gemini", context)
+            # 根據選擇的模型和具體版本生成回應，並傳入自定義 prompt
+            model_response = get_model_response(
+                query=query,
+                model=model,
+                context=context,
+                model_name=model_name if model_name else None,
+                custom_prompt=custom_prompt
+            )
 
             # 格式化執行時間為小數點後兩位
             execution_time = round(time.time() - start_time, 2)
 
-            # 建立回應字典，只包含使用者選擇的模型回應
-            model_response = {}
-            
-            # 根據使用者選擇的模型返回對應的回應
-            if model == "gpt-4" and gpt4_response and gpt4_response['answer']:
-                model_response = {
-                    'answer': gpt4_response['answer'],
-                    'metrics': gpt4_response['metrics']
-                }
-            elif model == "gemini" and gemini_response and gemini_response['answer']:
-                model_response = {
-                    'answer': gemini_response['answer'],
-                    'metrics': gemini_response['metrics']
-                }
-
             return {
                 'model_response': model_response,
-                'retrieved_docs': [doc['document'] for doc in retrieved_docs],
-                'similarity_scores': [round(doc['score'], 2) for doc in retrieved_docs],
+                'retrieved_docs': [doc['document'] for doc in docs],
+                'similarity_scores': [round(doc['score'], 2) for doc in docs],
                 'execution_time': execution_time
             }
-            
-        except Exception as e:
-            logging.error(f"處理請求時發生錯誤: {str(e)}")
-            logging.error(traceback.format_exc())
-            # 根據使用者選擇的模型返回空結構
-            empty_response = {}
-            if model == "gpt-4":
-                empty_response = {'answer': '', 'metrics': {'bleu_score': 0.0, 'rouge_score': 0.0, 'mrr_score': 0.0}}
-            elif model == "gemini":
-                empty_response = {'answer': '', 'metrics': {'bleu_score': 0.0, 'rouge_score': 0.0, 'mrr_score': 0.0}}
-                
+
+        except ValueError as ve:
+            logging.error(f"參數驗證錯誤: {str(ve)}")
             return {
-                'model_response': empty_response,
+                'model_response': {
+                    'answer': str(ve),
+                    'metrics': {'bleu_score': 0.0, 'rouge_score': 0.0, 'mrr_score': 0.0}
+                },
                 'retrieved_docs': [],
                 'similarity_scores': [],
                 'execution_time': round(time.time() - start_time, 2)
-            }
+            }, 400
 
 if __name__ == '__main__':
-     app.run(host="0.0.0.0", port=5000, debug=True)
+     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000))) 
