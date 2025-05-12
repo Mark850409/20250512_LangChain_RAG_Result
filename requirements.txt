@@ -30,3 +30,4 @@ accelerate==0.20.3
 
 bert-score==0.3.13
 evaluate==0.3.0
+jieba
